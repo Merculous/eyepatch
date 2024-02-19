@@ -1,7 +1,7 @@
 
 from struct import unpack
 from sys import version_info
-from typing import Generator
+from typing import Generator, Tuple
 
 from capstone import (
     CS_ARCH_ARM,
@@ -56,6 +56,12 @@ class Patcher(eyepatch.base._Patcher):
     _insn = Insn
     _string = ByteString
 
+    _ARM_SIZE = 4
+    _THUMB_SIZE = 2
+
+    _ARM_BITWISE = 3
+    _THUMB_BITWISE = 1
+
     def __init__(self, data: bytes):
         super().__init__(
             data=data,
@@ -78,94 +84,43 @@ class Patcher(eyepatch.base._Patcher):
         return asm
 
     def disasm(
-        self, offset: int, reverse: bool = False
-    ) -> Generator[_insn, None, None]:
-        if reverse:
-            loop = offset > 0
-        else:
-            loop = offset < len(self._data)
+        self, offset: int = 0, reverse: bool = False, force_thumb: bool = True
+    ) -> Generator[Tuple[_insn, _insn], None, None]:
 
-        while loop:
-            # disassemble as 16-bit thumb insn
-            if reverse:
-                if (offset - 2) == 0:
-                    raise ValueError('Offset is outside of data range')
+        i = offset
 
-                data = self._data[offset - 2 : offset]
+        while i > 0 and i < len(self.data):
+            thumb_insn = None
+            arm_insn = None
 
-            else:
-                if (offset + 2) > len(self._data):
-                    raise ValueError('Offset is outside of data range')
-
-                data = self._data[offset : offset + 2]
+            arm_buffer = self.data[i:i+self._ARM_SIZE]
+            thumb_buffer = arm_buffer[:self._THUMB_SIZE]
 
             try:
-                insn = next(self._thumb_disasm.disasm(code=data, offset=0))
-
-                if reverse:
-                    offset -= 2
-
-                yield self._insn(offset, data, insn, self)
-
-                if not reverse:
-                    offset += 2
-
-                continue
-
-            except (CsError, StopIteration):
+                if force_thumb:
+                    arm_insn = next(self._thumb_disasm.disasm(arm_buffer, i))
+                else:
+                    arm_insn = next(self._disasm.disasm(arm_buffer, i))
+            except StopIteration:
                 pass
-
-            # disassemble as 32-bit thumb insn
-            if reverse:
-                if (offset - 4) == 0:
-                    raise ValueError('Offset is outside of data range')
-
-                data = self._data[offset - 4 : offset]
-
-            else:
-                if (offset + 4) > len(self._data):
-                    raise ValueError('Offset is outside of data range')
-
-                data = self._data[offset : offset + 4]
 
             try:
-                insn = next(self._thumb_disasm.disasm(code=data, offset=0))
-
-                if reverse:
-                    offset -= 4
-
-                yield self._insn(offset, data, insn, self)
-
-                if not reverse:
-                    offset += 4
-
-                continue
-
-            except (CsError, StopIteration):
+                thumb_insn = next(self._thumb_disasm.disasm(thumb_buffer, i))
+            except StopIteration:
                 pass
 
-            # disassemble as 32-bit arm insn
-            try:
-                insn = next(self._disasm.disasm(code=data, offset=0))
+            if arm_insn:
+                arm_insn = self._insn(i, arm_buffer, arm_insn, self)
 
-                if reverse:
-                    offset -= 4
+            if thumb_insn:
+                thumb_insn = self._insn(i, thumb_buffer, thumb_insn, self)
 
-                yield self._insn(offset, data, insn, self)
+            yield arm_insn, thumb_insn
 
-                if not reverse:
-                    offset += 4
-
-                continue
-
-            except (CsError, StopIteration):
-                pass
-
-            # all else fails, just increment offset by 2
             if reverse:
-                offset -= 2
+                i -= self._THUMB_SIZE
             else:
-                offset += 2
+                i += self._THUMB_SIZE
 
     def search_imm(self, imm: int, offset: int = 0, skip: int = 0) -> _insn:
         for insn in self.disasm(offset):
@@ -212,42 +167,16 @@ class Patcher(eyepatch.base._Patcher):
     def search_xref(
         self, offset: int, base_addr: int, skip: int = 0, is_kernel: bool = False
     ) -> _insn:
-        ARM_SIZE = 4
-        ARM_BITWISE = 3
-
-        THUMB_SIZE = 2
-        THUMB_BITWISE = 1
-
         KERNEL_DIFFERENCE = 0x36000
-
-        SEARCH_THRESHOLD = offset - (1 << 16)
 
         # Always get THUMB instructions, even if the instruction is 4 bytes.
         # See xref comment below on why.
 
-        i = offset
-
         match = None
 
-        while i > SEARCH_THRESHOLD:
-            thumb_insn = None
-            arm_insn = None
-
-            arm_buffer = self.data[i:i+ARM_SIZE]
-            thumb_buffer = arm_buffer[:THUMB_SIZE]
-
+        for arm_insn, thumb_insn in self.disasm(offset, True):
             # For xref's, we MUST be using THUMB mode, regardless if such
             # instructions are 4 bytes long, like the "LDR.W" insn.
-
-            try:
-                arm_insn = next(self._thumb_disasm.disasm(arm_buffer, i))
-            except StopIteration:
-                pass
-
-            try:
-                thumb_insn = next(self._thumb_disasm.disasm(thumb_buffer, i))
-            except StopIteration:
-                pass
 
             current_insn = None
             bitwise_value = None
@@ -263,7 +192,6 @@ class Patcher(eyepatch.base._Patcher):
 
             elif thumb_insn is None and arm_insn is None:
                 # ARM and THUMB failed
-                i -= THUMB_SIZE
                 continue
 
             else:
@@ -279,21 +207,21 @@ class Patcher(eyepatch.base._Patcher):
                 if x == 1:
                     current_insn = thumb_insn
 
-                insn_size = current_insn.size
+                insn_size = current_insn.info.size
 
-                if insn_size == ARM_SIZE:
-                    bitwise_value = ARM_BITWISE
+                if insn_size == self._ARM_SIZE:
+                    bitwise_value = self._ARM_BITWISE
 
-                elif insn_size == THUMB_SIZE:
-                    bitwise_value = THUMB_BITWISE
+                elif insn_size == self._THUMB_SIZE:
+                    bitwise_value = self._THUMB_BITWISE
 
                 else:
                     raise Exception(f'Unknown instruction size: {insn_size}')
 
-                if len(current_insn.operands) == 0:
+                if len(current_insn.info.operands) == 0:
                     continue
 
-                op = current_insn.operands[-1]
+                op = current_insn.info.operands[-1]
 
                 if op.type != ARM_OP_MEM:
                     continue
@@ -301,7 +229,7 @@ class Patcher(eyepatch.base._Patcher):
                 if op.mem.base != ARM_REG_PC:
                     continue
 
-                insn_offset = (current_insn.address & ~
+                insn_offset = (current_insn.info.address & ~
                                bitwise_value) + op.mem.disp + 4
 
                 data = self.data[insn_offset:insn_offset+4]
@@ -328,8 +256,6 @@ class Patcher(eyepatch.base._Patcher):
 
             if match:
                 break
-
-            i -= THUMB_SIZE
 
         if match is None:
             raise eyepatch.SearchError(
