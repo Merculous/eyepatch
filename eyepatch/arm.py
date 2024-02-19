@@ -1,6 +1,7 @@
-from struct import pack, unpack
+
+from struct import unpack
 from sys import version_info
-from typing import Generator, Optional
+from typing import Generator
 
 from capstone import (
     CS_ARCH_ARM,
@@ -209,38 +210,129 @@ class Patcher(eyepatch.base._Patcher):
         return next(self.disasm(offset))
 
     def search_xref(
-        self, offset: int, base_addr: int, skip: int = 0
-    ) -> Optional[_insn]:
-        packed = pack('<I', base_addr + offset)
-        packed_offset = self.data.find(packed)
+        self, offset: int, base_addr: int, skip: int = 0, is_kernel: bool = False
+    ) -> _insn:
+        ARM_SIZE = 4
+        ARM_BITWISE = 3
 
-        while packed_offset != -1:
-            disasm = self.disasm(packed_offset - 0x100)
-            while (insn := next(disasm)).offset < (packed_offset + 0xFF):
-                if len(insn.info.operands) == 0:
+        THUMB_SIZE = 2
+        THUMB_BITWISE = 1
+
+        KERNEL_DIFFERENCE = 0x36000
+
+        SEARCH_THRESHOLD = offset - (1 << 16)
+
+        # Always get THUMB instructions, even if the instruction is 4 bytes.
+        # See xref comment below on why.
+
+        i = offset
+
+        match = None
+
+        while i > SEARCH_THRESHOLD:
+            thumb_insn = None
+            arm_insn = None
+
+            arm_buffer = self.data[i:i+ARM_SIZE]
+            thumb_buffer = arm_buffer[:THUMB_SIZE]
+
+            # For xref's, we MUST be using THUMB mode, regardless if such
+            # instructions are 4 bytes long, like the "LDR.W" insn.
+
+            try:
+                arm_insn = next(self._thumb_disasm.disasm(arm_buffer, i))
+            except StopIteration:
+                pass
+
+            try:
+                thumb_insn = next(self._thumb_disasm.disasm(thumb_buffer, i))
+            except StopIteration:
+                pass
+
+            current_insn = None
+            bitwise_value = None
+            two_insns = False
+
+            if thumb_insn is None and arm_insn:
+                # THUMB failed, ARM worked
+                current_insn = arm_insn
+
+            elif arm_insn is None and thumb_insn:
+                # ARM failed, THUMB worked
+                current_insn = thumb_insn
+
+            elif thumb_insn is None and arm_insn is None:
+                # ARM and THUMB failed
+                i -= THUMB_SIZE
+                continue
+
+            else:
+                # Successfully got both ARM and THUMB instructions
+                # Check ARM first, then do THUMB
+
+                two_insns = True
+                current_insn = arm_insn
+
+            loop_count = 2 if two_insns else 1
+
+            for x in range(loop_count):
+                if x == 1:
+                    current_insn = thumb_insn
+
+                insn_size = current_insn.size
+
+                if insn_size == ARM_SIZE:
+                    bitwise_value = ARM_BITWISE
+
+                elif insn_size == THUMB_SIZE:
+                    bitwise_value = THUMB_BITWISE
+
+                else:
+                    raise Exception(f'Unknown instruction size: {insn_size}')
+
+                if len(current_insn.operands) == 0:
                     continue
 
-                op = insn.info.operands[-1]
-                if op.type == ARM_OP_MEM:
-                    if packed_offset == -1:
+                op = current_insn.operands[-1]
+
+                if op.type != ARM_OP_MEM:
+                    continue
+
+                if op.mem.base != ARM_REG_PC:
+                    continue
+
+                insn_offset = (current_insn.address & ~
+                               bitwise_value) + op.mem.disp + 4
+
+                data = self.data[insn_offset:insn_offset+4]
+
+                offset2 = unpack('<I', data)[0]
+                result = offset2 - base_addr
+
+                if not is_kernel:
+                    if result != offset:
                         continue
 
-                    if op.mem.base != ARM_REG_PC:
+                    match = current_insn
+
+                else:
+                    if result - offset != KERNEL_DIFFERENCE:
                         continue
 
-                    if packed_offset == (insn.offset & ~3) + op.mem.disp + 0x4:
-                        if skip == 0:
-                            return insn
+                    match = current_insn
 
-                        skip -= 1
+                if skip == 0:
+                    break
 
-                elif op.type == ARM_OP_IMM:
-                    if op.imm + insn.offset == offset:
-                        if skip == 0:
-                            return insn
+                skip -= 1
 
-                        skip -= 1
+            if match:
+                break
 
-            packed_offset = self.data.find(packed, packed_offset + 1)
+            i -= THUMB_SIZE
 
-        raise eyepatch.SearchError(f'Failed to find xrefs to offset: 0x{offset:x}')
+        if match is None:
+            raise eyepatch.SearchError(
+                f'Failed to find xrefs to offset: 0x{offset:x}')
+
+        return match
