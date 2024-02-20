@@ -122,36 +122,85 @@ class Patcher(eyepatch.base._Patcher):
             else:
                 i += self._THUMB_SIZE
 
-    def search_imm(self, imm: int, offset: int = 0, skip: int = 0) -> _insn:
-        for insn in self.disasm(offset):
-            if len(insn.info.operands) == 0:
+    def search_imm(
+        self, imm: int, offset: int = 0, reverse: bool = False, skip: int = 0
+    ) -> _insn:
+
+        match = None
+
+        for arm_insn, thumb_insn in self.disasm(offset, reverse):
+            loop_count = 1
+            current_insn = None
+
+            if arm_insn and not thumb_insn:
+                current_insn = arm_insn
+
+            elif thumb_insn and not arm_insn:
+                current_insn = thumb_insn
+
+            elif arm_insn and thumb_insn:
+                loop_count += 1
+                current_insn = arm_insn
+            else:
                 continue
 
-            op = insn.info.operands[-1]
-            if op.type == ARM_OP_MEM:
-                if op.mem.base != ARM_REG_PC:
+            for x in range(loop_count):
+                if x == 1:
+                    current_insn = thumb_insn
+
+                insn_size = current_insn.info.size
+                insn_bitwise = 0
+
+                if insn_size == self._ARM_SIZE:
+                    insn_bitwise += self._ARM_BITWISE
+
+                elif insn_size == self._THUMB_SIZE:
+                    insn_bitwise += self._THUMB_BITWISE
+
+                else:
+                    raise Exception(f'Unknown instruction size: {insn_size}')
+
+                if len(current_insn.info.operands) == 0:
                     continue
 
-                imm_offset = (insn.offset & ~3) + op.mem.disp + 0x4
-                data = self.data[imm_offset : imm_offset + 4]
-                insn_imm = unpack('<i', data)[0]
+                op = current_insn.info.operands[-1]
 
-                if insn_imm == imm:
-                    if skip == 0:
-                        return insn
+                if op.type == ARM_OP_MEM:
+                    if op.mem.base != ARM_REG_PC:
+                        continue
 
-                    skip -= 1
+                    imm_offset = (current_insn.offset & ~
+                                  insn_bitwise) + op.mem.disp + 4
 
-            elif op.type == ARM_OP_IMM:
-                if op.imm == imm:
-                    if skip == 0:
-                        return insn
+                    data = self.data[imm_offset : imm_offset + 4]
 
-                    skip -= 1
-        else:
+                    insn_imm = unpack('<I', data)[0]
+
+                    if insn_imm == imm:
+                        if skip == 0:
+                            match = current_insn
+
+                        skip -= 1
+
+                elif op.type == ARM_OP_IMM:
+                    if op.imm == imm:
+                        if skip == 0:
+                            match = current_insn
+
+                        skip -= 1
+
+                if match:
+                    break
+
+            if match:
+                break
+
+        if match is None:
             raise eyepatch.SearchError(
                 f'Failed to find instruction with immediate value: {hex(imm)}'
             )
+
+        return match
 
     def search_thumb_insns(self, *insns: str, offset: int = 0) -> _insn:
         instructions = '\n'.join(insns)
