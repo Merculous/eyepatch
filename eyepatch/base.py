@@ -147,6 +147,7 @@ class _Disassembler:
     def data(self) -> bytes:
         return bytes(self._data)
 
+    '''
     def disasm(
         self, offset: int, reverse: bool = False
     ) -> Generator[_insn, None, None]:
@@ -171,7 +172,9 @@ class _Disassembler:
                 yield self._insn(i, data, insn, self)
             except (CsError, StopIteration):
                 pass
+    '''
 
+    '''
     def search_insn(
         self, insn_name: str, offset: int = 0, skip: int = 0, reverse: bool = False
     ) -> Optional[_insn]:
@@ -183,7 +186,8 @@ class _Disassembler:
                 skip -= 1
 
         raise eyepatch.SearchError(f'Failed to find instruction: {insn_name}')
-
+    '''
+ 
     def search_imm(self, imm: int, offset: int = 0, skip: int = 0) -> _insn:
         for insn in self.disasm(offset):
             if any(imm == op.imm for op in insn.info.operands):
@@ -196,6 +200,7 @@ class _Disassembler:
             f'Failed to find instruction with immediate value: {hex(imm)}'
         )
 
+    '''
     def search_string(
         self,
         string: Optional[Union[str, bytes]] = None,
@@ -235,7 +240,8 @@ class _Disassembler:
             raise ValueError('Either string or offset must be provided.')
 
         return self._string(str_begin, self._data[str_begin:str_end], self)
-
+    '''
+ 
 
 class _Patcher(_Assembler, _Disassembler):
     def __init__(self, data: bytes, asm: Ks, disasm: Cs):
