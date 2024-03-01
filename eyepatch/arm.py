@@ -163,7 +163,7 @@ class Patcher(eyepatch.base._Patcher):
 
         i = offset
 
-        while i > 0 and i < len(self.data):
+        while i >= 0 and i < len(self.data):
             thumb_insn = None
             arm_insn = None
 
